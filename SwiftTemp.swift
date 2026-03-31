@@ -12,6 +12,7 @@ struct SwiftTempApp: App {
         } label: {
             Text(model.menuBarText)
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -19,42 +20,65 @@ struct MenuContent: View {
     @ObservedObject var model: WeatherModel
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 14) {
             if let tempC = model.temperatureC {
                 let tempF = (tempC * 9.0 / 5.0) + 32.0
 
-                Text(String(format: "%.1f°F / %.1f°C", tempF, tempC))
-                    .font(.headline)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(format: "%.1f°F / %.1f°C", tempF, tempC))
+                        .font(.system(size: 30, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
 
-                if let locationSummary = model.locationSummary {
-                    Text(locationSummary)
-                        .foregroundStyle(.secondary)
-                }
+                    if let locationSummary = model.locationSummary {
+                        Text(locationSummary)
+                            .font(.system(size: 16, weight: .medium, design: .rounded))
+                            .foregroundStyle(.primary)
+                    }
 
-                if let coordinateSummary = model.coordinateSummary {
-                    Text(coordinateSummary)
+                    Text("IP-based weather from Open-Meteo")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                if let geohash = model.geohash {
-                    Text("Geohash: \(geohash)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    if let coordinateSummary = model.coordinateSummary {
+                        CopyValueRow(
+                            title: "Coordinates",
+                            value: coordinateSummary
+                        )
+                    }
+
+                    if let geohash = model.geohash {
+                        CopyValueRow(
+                            title: "Geohash",
+                            value: geohash
+                        )
+                    }
                 }
 
-                Text(model.refreshStatusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                RefreshStatusView(nextRefreshDate: model.nextRefreshDate)
 
                 Divider()
 
-                Button("Refresh Now") {
-                    model.refresh()
+                HStack(spacing: 10) {
+                    Button {
+                        model.refresh()
+                    } label: {
+                        Label("Refresh Now", systemImage: "arrow.clockwise")
+                    }
+                    .keyboardShortcut("r")
+
+                    Button {
+                        NSApplication.shared.terminate(nil)
+                    } label: {
+                        Label("Quit", systemImage: "xmark.circle")
+                    }
+                    .keyboardShortcut("q")
                 }
-                .keyboardShortcut("r")
+                .buttonStyle(.bordered)
             } else if let errorMessage = model.errorMessage {
                 Text(errorMessage)
+                    .font(.body.weight(.medium))
                     .foregroundStyle(.red)
 
                 if let locationSummary = model.locationSummary {
@@ -62,29 +86,34 @@ struct MenuContent: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text(model.refreshStatusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                RefreshStatusView(nextRefreshDate: model.nextRefreshDate)
 
                 Divider()
 
-                Button("Retry") {
-                    model.refresh()
+                HStack(spacing: 10) {
+                    Button {
+                        model.refresh()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+
+                    Button {
+                        NSApplication.shared.terminate(nil)
+                    } label: {
+                        Label("Quit", systemImage: "xmark.circle")
+                    }
                 }
+                .buttonStyle(.bordered)
             } else {
                 Text("Loading...")
-                Text(model.refreshStatusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.title3.weight(.medium))
+                    .foregroundStyle(.primary)
+
+                RefreshStatusView(nextRefreshDate: model.nextRefreshDate)
             }
         }
-
-        Divider()
-
-        Button("Quit") {
-            NSApplication.shared.terminate(nil)
-        }
-        .keyboardShortcut("q")
+        .frame(width: 360)
+        .padding(16)
     }
 }
 
@@ -96,10 +125,8 @@ final class WeatherModel: ObservableObject {
     @Published var coordinateSummary: String?
     @Published var geohash: String?
     @Published var nextRefreshDate: Date?
-    @Published private var now = Date()
 
     private var refreshTimer: Timer?
-    private var clockTimer: Timer?
     private let refreshInterval: TimeInterval = 600
 
     var menuBarText: String {
@@ -110,24 +137,6 @@ final class WeatherModel: ObservableObject {
         return String(format: "%.0f°F %.0f°C", temperatureF, temperatureC)
     }
 
-    var refreshStatusText: String {
-        guard let nextRefreshDate else {
-            return "Refreshing via ipapi.co"
-        }
-
-        let timeText = nextRefreshDate.formatted(
-            Date.FormatStyle()
-                .hour(.defaultDigits(amPM: .abbreviated))
-                .minute(.twoDigits)
-        )
-
-        let remaining = max(0, Int(nextRefreshDate.timeIntervalSince(now)))
-        let minutes = remaining / 60
-        let seconds = remaining % 60
-
-        return String(format: "Next refresh at %@ (%dm %02ds) via ipapi.co", timeText, minutes, seconds)
-    }
-
     init() {
         refresh()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
@@ -135,21 +144,14 @@ final class WeatherModel: ObservableObject {
                 self?.refresh()
             }
         }
-        clockTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.now = Date()
-            }
-        }
     }
 
     deinit {
         refreshTimer?.invalidate()
-        clockTimer?.invalidate()
     }
 
     func refresh() {
-        now = Date()
-        nextRefreshDate = now.addingTimeInterval(refreshInterval)
+        nextRefreshDate = Date().addingTimeInterval(refreshInterval)
 
         Task {
             do {
@@ -162,7 +164,6 @@ final class WeatherModel: ObservableObject {
                 coordinateSummary = Self.formatCoordinateSummary(latitude: location.latitude, longitude: location.longitude)
                 geohash = Self.encodeGeohash(latitude: location.latitude, longitude: location.longitude)
             } catch {
-                temperatureC = nil
                 errorMessage = error.localizedDescription
             }
         }
@@ -261,6 +262,66 @@ final class WeatherModel: ObservableObject {
         }
 
         return geohash
+    }
+}
+
+private struct CopyValueRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+            } label: {
+                HStack(spacing: 8) {
+                    Text(value)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.primary)
+
+                    Image(systemName: "clipboard")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.borderless)
+            .help("Copy \(title.lowercased())")
+        }
+    }
+}
+
+private struct RefreshStatusView: View {
+    let nextRefreshDate: Date?
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text(statusText(now: context.date))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func statusText(now: Date) -> String {
+        guard let nextRefreshDate else {
+            return "Refreshing via ipapi.co"
+        }
+
+        let timeText = nextRefreshDate.formatted(
+            Date.FormatStyle()
+                .hour(.defaultDigits(amPM: .abbreviated))
+                .minute(.twoDigits)
+        )
+
+        let remaining = max(0, Int(nextRefreshDate.timeIntervalSince(now)))
+        let minutes = remaining / 60
+        let seconds = remaining % 60
+
+        return String(format: "Next refresh at %@ (%dm %02ds)", timeText, minutes, seconds)
     }
 }
 
