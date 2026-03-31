@@ -1,6 +1,6 @@
 # SwiftTemp
 
-SwiftUI menu bar app that shows the current temperature in Fahrenheit and Celsius.
+SwiftUI menu bar app that shows the current temperature in Fahrenheit and Celsius, plus sun timing, UV index, and AQI.
 
 > [!CAUTION]
 > This app was "vibe coded" with Opus 4.6, GPT-5.4, and Sonnet 4.6. Do not use it as is, do not trust this code!
@@ -9,7 +9,7 @@ SwiftUI menu bar app that shows the current temperature in Fahrenheit and Celsiu
 
 - This version is intentionally minimal: one Swift source file plus this README.
 - It uses IP-based geolocation instead of CoreLocation, so it does not need app bundles, entitlements, or location permission prompts.
-- Weather data comes from [Open-Meteo](https://open-meteo.com/). IP lookup comes from [ipapi.co](https://ipapi.co/).
+- Weather and air-quality data come from [Open-Meteo](https://open-meteo.com/). IP lookup comes from [ipapi.co](https://ipapi.co/).
 
 ## Build
 
