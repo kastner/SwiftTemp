@@ -26,3 +26,33 @@ swiftc -parse-as-library -framework SwiftUI -framework AppKit -o SwiftTemp Swift
 ```
 
 The app lives in the macOS menu bar and refreshes automatically every 10 minutes.
+
+## Launch At Startup
+
+Because this project is a bare executable rather than a bundled `.app`, the simplest startup option is a per-user `launchd` agent managed by the included script.
+
+1. Build the binary:
+
+```bash
+swiftc -parse-as-library -framework SwiftUI -framework AppKit -o SwiftTemp SwiftTemp.swift
+```
+
+2. Add it to startup:
+
+```bash
+./startup.sh add
+```
+
+3. If you rebuild the binary later, reload the login item:
+
+```bash
+./startup.sh update
+```
+
+4. To remove it from startup:
+
+```bash
+./startup.sh remove
+```
+
+The script writes `~/Library/LaunchAgents/com.kastner.swifttemp.plist` pointing at the `SwiftTemp` binary in this checkout. If you move the checkout, run `./startup.sh update`.
