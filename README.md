@@ -2,6 +2,9 @@
 
 SwiftUI menu bar app that shows the current temperature in Fahrenheit and Celsius.
 
+> [!CAUTION]
+> This app was "vibe coded" with Opus 4.6, GPT-5.4, and Sonnet 4.6. Do not use it as is, do not trust this code!
+
 ## Notes
 
 - This version is intentionally minimal: one Swift source file plus this README.
