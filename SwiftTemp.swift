@@ -189,6 +189,9 @@ final class WeatherModel: ObservableObject {
 
     private var refreshTimer: Timer?
     private let refreshInterval: TimeInterval = 600
+    private let stationCandidateLimit = 12
+    private let stationUsedLimit = 8
+    private let maxStationObservationAgeMinutes = 90.0
 
     var menuBarText: String {
         guard let temperatureC else {
@@ -328,45 +331,55 @@ final class WeatherModel: ObservableObject {
         let hourlyForecast = try JSONDecoder().decode(NWSHourlyForecastResponse.self, from: hourlyData)
         let stations = try JSONDecoder().decode(NWSStationsResponse.self, from: stationsData)
         let gridTemperatureSummary = hourlyForecast.properties.periods.first.map(Self.formatNWSGridTemperatureSummary)
-        let sortedStationIdentifiers = stations.features
-            .sorted { lhs, rhs in
-                Self.distanceInMeters(
+        let sortedStations = stations.features
+            .compactMap { station -> NWSStationDistance? in
+                guard station.geometry.coordinates.count >= 2 else {
+                    return nil
+                }
+
+                let distanceMeters = Self.distanceInMeters(
                     latitudeA: latitude,
                     longitudeA: longitude,
-                    latitudeB: lhs.geometry.coordinates[1],
-                    longitudeB: lhs.geometry.coordinates[0]
-                ) < Self.distanceInMeters(
-                    latitudeA: latitude,
-                    longitudeA: longitude,
-                    latitudeB: rhs.geometry.coordinates[1],
-                    longitudeB: rhs.geometry.coordinates[0]
+                    latitudeB: station.geometry.coordinates[1],
+                    longitudeB: station.geometry.coordinates[0]
+                )
+
+                return NWSStationDistance(
+                    stationIdentifier: station.properties.stationIdentifier,
+                    distanceMeters: distanceMeters
                 )
             }
-            .map(\.properties.stationIdentifier)
+            .sorted { lhs, rhs in
+                lhs.distanceMeters < rhs.distanceMeters
+            }
         let stationObservations = try await fetchStationObservations(
-            stationIdentifiers: Array(sortedStationIdentifiers.prefix(8)),
+            stations: Array(sortedStations.prefix(stationCandidateLimit)),
             headers: headers,
-            limit: 3
+            maxAgeMinutes: maxStationObservationAgeMinutes
+        )
+        let weightedStations = Array(
+            stationObservations
+                .sorted { lhs, rhs in lhs.weight > rhs.weight }
+                .prefix(stationUsedLimit)
         )
 
         return NationalWeatherServiceContext(
-            averageTemperatureC: Self.averageTemperature(from: stationObservations),
-            temperatureSourceSummary: Self.formatTemperatureSourceSummary(for: stationObservations.count),
-            observationSummary: Self.formatStationObservationSummary(for: stationObservations),
+            averageTemperatureC: Self.weightedAverageTemperature(from: weightedStations),
+            temperatureSourceSummary: Self.formatTemperatureSourceSummary(
+                usedStationCount: weightedStations.count,
+                availableStationCount: stations.features.count
+            ),
+            observationSummary: Self.formatStationObservationSummary(for: weightedStations),
             gridTemperatureSummary: gridTemperatureSummary,
-            stationTemperatureSummaries: stationObservations.map(Self.formatStationTemperatureSummary)
+            stationTemperatureSummaries: weightedStations.map(Self.formatStationTemperatureSummary)
         )
     }
 
-    private func fetchStationObservations(stationIdentifiers: [String], headers: [String: String], limit: Int) async throws -> [NWSStationObservation] {
+    private func fetchStationObservations(stations: [NWSStationDistance], headers: [String: String], maxAgeMinutes: Double) async throws -> [NWSStationObservation] {
         var observations: [NWSStationObservation] = []
 
-        for stationIdentifier in stationIdentifiers {
-            if observations.count == limit {
-                break
-            }
-
-            guard let url = URL(string: "https://api.weather.gov/stations/\(stationIdentifier)/observations/latest") else {
+        for station in stations {
+            guard let url = URL(string: "https://api.weather.gov/stations/\(station.stationIdentifier)/observations/latest") else {
                 continue
             }
 
@@ -375,8 +388,10 @@ final class WeatherModel: ObservableObject {
                 let observation = try JSONDecoder().decode(NWSObservationResponse.self, from: data)
 
                 if let stationObservation = Self.makeStationObservation(
-                    stationIdentifier: stationIdentifier,
-                    observation: observation.properties
+                    stationIdentifier: station.stationIdentifier,
+                    distanceMeters: station.distanceMeters,
+                    observation: observation.properties,
+                    maxAgeMinutes: maxAgeMinutes
                 ) {
                     observations.append(stationObservation)
                 }
@@ -412,7 +427,9 @@ final class WeatherModel: ObservableObject {
     }
 
     private static func formatCoordinateSummary(latitude: Double, longitude: Double) -> String {
-        String(format: "GPS: %.5f, %.5f", latitude, longitude)
+        let decimal = String(format: "%.5f, %.5f", latitude, longitude)
+        let dms = "\(formatCoordinateDMS(latitude, positiveSuffix: "N", negativeSuffix: "S")) \(formatCoordinateDMS(longitude, positiveSuffix: "E", negativeSuffix: "W"))"
+        return "\(decimal) | \(dms)"
     }
 
     private static func resolveSunEvent(currentTime: String, isDay: Int, daily: DailyForecast, timezoneIdentifier: String) -> SunEvent? {
@@ -508,54 +525,86 @@ final class WeatherModel: ObservableObject {
         return "\(period.temperature)°\(period.temperatureUnit) at \(timestamp)"
     }
 
-    private static func makeStationObservation(stationIdentifier: String, observation: NWSObservationProperties) -> NWSStationObservation? {
-        guard let temperatureC = observation.temperature.value else {
+    private static func makeStationObservation(
+        stationIdentifier: String,
+        distanceMeters: Double,
+        observation: NWSObservationProperties,
+        maxAgeMinutes: Double
+    ) -> NWSStationObservation? {
+        guard let temperatureC = observation.temperature.value,
+              let observationDate = parseISODate(observation.timestamp) else {
             return nil
         }
+
+        let ageMinutes = max(0, Date().timeIntervalSince(observationDate) / 60)
+        guard ageMinutes <= maxAgeMinutes else {
+            return nil
+        }
+
+        let distanceKilometers = distanceMeters / 1_000
+        let distanceWeight = 1 / max(1, sqrt(distanceKilometers + 1))
+        let recencyWeight = exp(-ageMinutes / 45)
+        let weight = distanceWeight * recencyWeight
 
         return NWSStationObservation(
             stationIdentifier: stationIdentifier,
             timestamp: observation.timestamp,
-            temperatureC: temperatureC
+            temperatureC: temperatureC,
+            distanceMeters: distanceMeters,
+            ageMinutes: ageMinutes,
+            weight: weight
         )
     }
 
     private static func formatStationTemperatureSummary(_ observation: NWSStationObservation) -> String {
         let temperatureF = (observation.temperatureC * 9.0 / 5.0) + 32.0
-        let timestamp = parseISODate(observation.timestamp)?.formatted(.dateTime.hour().minute()) ?? observation.timestamp
-        return String(format: "%@ %.0f°F at %@", observation.stationIdentifier, temperatureF, timestamp)
+        let distanceMiles = observation.distanceMeters / 1_609.344
+        return String(
+            format: "%@ %.0f°F %.0fmi %.0fm ago",
+            observation.stationIdentifier,
+            temperatureF,
+            distanceMiles,
+            observation.ageMinutes
+        )
     }
 
-    private static func averageTemperature(from observations: [NWSStationObservation]) -> Double? {
+    private static func weightedAverageTemperature(from observations: [NWSStationObservation]) -> Double? {
         guard !observations.isEmpty else {
             return nil
         }
 
-        let sum = observations.reduce(0.0) { partialResult, observation in
-            partialResult + observation.temperatureC
+        let weightSum = observations.reduce(0.0) { partialResult, observation in
+            partialResult + observation.weight
         }
-        return sum / Double(observations.count)
-    }
-
-    private static func formatTemperatureSourceSummary(for stationCount: Int) -> String? {
-        guard stationCount > 0 else {
+        guard weightSum > 0 else {
             return nil
         }
 
-        return "Average of \(stationCount) closest NWS stations"
+        let weightedTemperatureSum = observations.reduce(0.0) { partialResult, observation in
+            partialResult + (observation.temperatureC * observation.weight)
+        }
+        return weightedTemperatureSum / weightSum
+    }
+
+    private static func formatTemperatureSourceSummary(usedStationCount: Int, availableStationCount: Int) -> String? {
+        guard usedStationCount > 0 else {
+            return nil
+        }
+
+        return "Weighted avg of \(usedStationCount) nearby NWS stations (\(availableStationCount) available)"
     }
 
     private static func formatStationObservationSummary(for observations: [NWSStationObservation]) -> String? {
-        let dates = observations.compactMap { parseISODate($0.timestamp) }.sorted()
-        guard let first = dates.first, let last = dates.last else {
+        let ages = observations.map(\.ageMinutes).sorted()
+        guard let youngest = ages.first, let oldest = ages.last else {
             return nil
         }
 
-        if first == last {
-            return "Stations observed at \(first.formatted(.dateTime.hour().minute()))"
+        if youngest == oldest {
+            return String(format: "Distance + recency weighted, %.0fm old", youngest)
         }
 
-        return "Stations observed \(first.formatted(.dateTime.hour().minute()))-\(last.formatted(.dateTime.hour().minute()))"
+        return String(format: "Distance + recency weighted, %.0f-%.0fm old", youngest, oldest)
     }
 
     private static func distanceInMeters(latitudeA: Double, longitudeA: Double, latitudeB: Double, longitudeB: Double) -> Double {
@@ -573,6 +622,16 @@ final class WeatherModel: ObservableObject {
 
     private static func parseISODate(_ value: String) -> Date? {
         ISO8601DateFormatter().date(from: value)
+    }
+
+    private static func formatCoordinateDMS(_ coordinate: Double, positiveSuffix: String, negativeSuffix: String) -> String {
+        let absoluteCoordinate = abs(coordinate)
+        let degrees = Int(absoluteCoordinate)
+        let minutesFull = (absoluteCoordinate - Double(degrees)) * 60
+        let minutes = Int(minutesFull)
+        let seconds = (minutesFull - Double(minutes)) * 60
+        let suffix = coordinate >= 0 ? positiveSuffix : negativeSuffix
+        return String(format: "%d°%02d'%02.0f\"%@", degrees, minutes, seconds, suffix)
     }
 
     private static func aqiCategory(for value: Int) -> String {
@@ -886,10 +945,18 @@ private struct NWSQuantitativeValue: Decodable {
     let value: Double?
 }
 
+private struct NWSStationDistance {
+    let stationIdentifier: String
+    let distanceMeters: Double
+}
+
 private struct NWSStationObservation {
     let stationIdentifier: String
     let timestamp: String
     let temperatureC: Double
+    let distanceMeters: Double
+    let ageMinutes: Double
+    let weight: Double
 }
 
 private enum WeatherError: LocalizedError {
