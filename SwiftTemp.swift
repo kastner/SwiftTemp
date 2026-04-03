@@ -38,6 +38,12 @@ struct MenuContent: View {
                     Text("IP-based weather from Open-Meteo")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    if let observationSummary = model.observationSummary {
+                        Text(observationSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -151,6 +157,7 @@ final class WeatherModel: ObservableObject {
     @Published var sunEventValue: String?
     @Published var uvIndexSummary: String?
     @Published var airQualitySummary: String?
+    @Published var observationSummary: String?
     @Published var nextRefreshDate: Date?
 
     private var refreshTimer: Timer?
@@ -198,6 +205,11 @@ final class WeatherModel: ObservableObject {
                 sunEventValue = weather.sunEventValue
                 uvIndexSummary = Self.formatUVIndex(weather.uvIndex)
                 airQualitySummary = Self.formatAirQuality(airQuality?.usAQI)
+                observationSummary = Self.formatObservationSummary(
+                    time: weather.observationTime,
+                    intervalSeconds: weather.observationIntervalSeconds,
+                    timezoneIdentifier: weather.timezoneIdentifier
+                )
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -232,7 +244,10 @@ final class WeatherModel: ObservableObject {
         return WeatherSnapshot(
             temperatureC: response.current.temperature2m,
             uvIndex: response.current.uvIndex,
-            sunEvent: Self.resolveSunEvent(currentTime: response.current.time, isDay: response.current.isDay, daily: response.daily, timezoneIdentifier: response.timezone)
+            sunEvent: Self.resolveSunEvent(currentTime: response.current.time, isDay: response.current.isDay, daily: response.daily, timezoneIdentifier: response.timezone),
+            observationTime: response.current.time,
+            observationIntervalSeconds: response.current.interval,
+            timezoneIdentifier: response.timezone
         )
     }
 
@@ -335,6 +350,22 @@ final class WeatherModel: ObservableObject {
 
         let roundedValue = Int(value.rounded())
         return "\(roundedValue) (\(aqiCategory(for: roundedValue)))"
+    }
+
+    private static func formatObservationSummary(time: String, intervalSeconds: Int?, timezoneIdentifier: String) -> String {
+        let timestamp: String
+        if let date = parseLocalDate(time, timezoneIdentifier: timezoneIdentifier) {
+            timestamp = date.formatted(.dateTime.hour().minute())
+        } else {
+            timestamp = time
+        }
+
+        guard let intervalSeconds, intervalSeconds > 0 else {
+            return "Observed at \(timestamp)"
+        }
+
+        let intervalMinutes = max(1, intervalSeconds / 60)
+        return "Observed at \(timestamp) (\(intervalMinutes)-minute cadence)"
     }
 
     private static func aqiCategory(for value: Int) -> String {
@@ -511,12 +542,14 @@ private struct ForecastResponse: Decodable {
 
 private struct CurrentForecast: Decodable {
     let time: String
+    let interval: Int?
     let temperature2m: Double
     let isDay: Int
     let uvIndex: Double?
 
     enum CodingKeys: String, CodingKey {
         case time
+        case interval
         case temperature2m = "temperature_2m"
         case isDay = "is_day"
         case uvIndex = "uv_index"
@@ -544,6 +577,9 @@ private struct WeatherSnapshot {
     let temperatureC: Double
     let uvIndex: Double?
     let sunEvent: SunEvent?
+    let observationTime: String
+    let observationIntervalSeconds: Int?
+    let timezoneIdentifier: String
 
     var sunEventTitle: String? {
         sunEvent?.title
