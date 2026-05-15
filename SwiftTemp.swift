@@ -41,7 +41,28 @@ struct MenuContent: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    if let observationSummary = model.observationSummary {
+                    if model.yolinkTemperatureDevices.count > 1 {
+                        HStack(spacing: 4) {
+                            Text("Observed by")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            Picker(
+                                "YoLink Sensor",
+                                selection: Binding(
+                                    get: { model.selectedYoLinkDeviceId },
+                                    set: { model.selectYoLinkDevice(deviceId: $0) }
+                                )
+                            ) {
+                                ForEach(model.yolinkTemperatureDevices) { device in
+                                    Text(device.name).tag(device.deviceId)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .controlSize(.small)
+                        }
+                    } else if let observationSummary = model.observationSummary {
                         Text(observationSummary)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -186,12 +207,16 @@ final class WeatherModel: ObservableObject {
     @Published var nwsGridSummary: String?
     @Published var stationTemperatureSummaries: [String] = []
     @Published var nextRefreshDate: Date?
+    @Published var yolinkTemperatureDevices: [YoLinkDevice] = []
+    @Published var selectedYoLinkDeviceId: String = UserDefaults.standard.string(forKey: selectedYoLinkDeviceIdDefaultsKey) ?? ""
 
     private var refreshTimer: Timer?
     private let refreshInterval: TimeInterval = 600
     private let stationCandidateLimit = 12
     private let stationUsedLimit = 8
     private let maxStationObservationAgeMinutes = 90.0
+    private let yolinkConfig = YoLinkConfig.fromEnvironment()
+    private static let selectedYoLinkDeviceIdDefaultsKey = "selectedYoLinkDeviceId"
 
     var menuBarText: String {
         guard let temperatureC else {
@@ -227,18 +252,19 @@ final class WeatherModel: ObservableObject {
                 let weather = try await weatherTask
                 let airQuality = try? await airQualityTask
                 let nwsContext = try? await nwsTask
+                let yolinkSnapshot = try? await fetchYoLinkTemperature()
 
-                temperatureC = nwsContext?.averageTemperatureC ?? weather.temperatureC
+                temperatureC = yolinkSnapshot?.temperatureC ?? nwsContext?.averageTemperatureC ?? weather.temperatureC
                 errorMessage = nil
                 locationSummary = Self.formatLocationSummary(from: location)
-                temperatureSourceSummary = nwsContext?.temperatureSourceSummary ?? "IP-based weather from Open-Meteo"
+                temperatureSourceSummary = yolinkSnapshot?.sourceSummary ?? nwsContext?.temperatureSourceSummary ?? "IP-based weather from Open-Meteo"
                 coordinateSummary = Self.formatCoordinateSummary(latitude: location.latitude, longitude: location.longitude)
                 geohash = Self.encodeGeohash(latitude: location.latitude, longitude: location.longitude)
                 sunEventTitle = weather.sunEventTitle
                 sunEventValue = weather.sunEventValue
                 uvIndexSummary = Self.formatUVIndex(weather.uvIndex)
                 airQualitySummary = Self.formatAirQuality(airQuality?.usAQI)
-                observationSummary = nwsContext?.observationSummary ?? Self.formatObservationSummary(
+                observationSummary = yolinkSnapshot?.observationSummary ?? nwsContext?.observationSummary ?? Self.formatObservationSummary(
                     time: weather.observationTime,
                     intervalSeconds: weather.observationIntervalSeconds,
                     timezoneIdentifier: weather.timezoneIdentifier
@@ -255,6 +281,11 @@ final class WeatherModel: ObservableObject {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    func selectYoLinkDevice(deviceId: String) {
+        UserDefaults.standard.set(deviceId, forKey: Self.selectedYoLinkDeviceIdDefaultsKey)
+        refresh()
     }
 
     private func fetchData(from url: URL, headers: [String: String] = [:]) async throws -> Data {
@@ -314,6 +345,107 @@ final class WeatherModel: ObservableObject {
         let data = try await fetchData(from: components.url!)
         let response = try JSONDecoder().decode(AirQualityResponse.self, from: data)
         return AirQualitySnapshot(usAQI: response.current.usAQI)
+    }
+
+    private func fetchYoLinkTemperature() async throws -> YoLinkTemperatureSnapshot? {
+        guard let yolinkConfig else {
+            return nil
+        }
+
+        let accessToken = try await fetchYoLinkAccessToken(config: yolinkConfig)
+        let device = try await resolveYoLinkTemperatureDevice(config: yolinkConfig, accessToken: accessToken)
+        let response = try await sendYoLinkAPIRequest(
+            accessToken: accessToken,
+            packet: YoLinkRequestPacket(
+                method: "THSensor.getState",
+                time: Self.currentMilliseconds(),
+                targetDevice: device.deviceId,
+                token: device.token,
+                params: nil
+            ),
+            responseType: YoLinkTHSensorStateResponse.self
+        )
+
+        guard response.code == "000000" else {
+            throw WeatherError.yolinkFailed(response.desc ?? response.code)
+        }
+
+        return YoLinkTemperatureSnapshot(
+            temperatureC: response.data.state.temperature,
+            humidity: response.data.state.humidity,
+            reportDate: Self.parseISODate(response.data.reportAt),
+            deviceName: device.name
+        )
+    }
+
+    private func fetchYoLinkAccessToken(config: YoLinkConfig) async throws -> String {
+        var request = URLRequest(url: URL(string: "https://api.yosmart.com/open/yolink/token")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        var components = URLComponents()
+        components.queryItems = [
+            URLQueryItem(name: "grant_type", value: "client_credentials"),
+            URLQueryItem(name: "client_id", value: config.uaid),
+            URLQueryItem(name: "client_secret", value: config.secret)
+        ]
+        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(YoLinkTokenResponse.self, from: data).accessToken
+    }
+
+    private func resolveYoLinkTemperatureDevice(config: YoLinkConfig, accessToken: String) async throws -> YoLinkDevice {
+        if let deviceId = config.deviceId, let token = config.deviceToken {
+            let device = YoLinkDevice(deviceId: deviceId, name: config.deviceName ?? "YoLink outdoor sensor", token: token, type: "THSensor")
+            yolinkTemperatureDevices = [device]
+            selectedYoLinkDeviceId = device.deviceId
+            return device
+        }
+
+        let response = try await sendYoLinkAPIRequest(
+            accessToken: accessToken,
+            packet: YoLinkRequestPacket(
+                method: "Home.getDeviceList",
+                time: Self.currentMilliseconds(),
+                targetDevice: nil,
+                token: nil,
+                params: nil
+            ),
+            responseType: YoLinkDeviceListResponse.self
+        )
+
+        guard response.code == "000000" else {
+            throw WeatherError.yolinkFailed(response.desc ?? response.code)
+        }
+
+        let temperatureDevices = response.data.devices.filter { $0.type == "THSensor" }
+        yolinkTemperatureDevices = temperatureDevices
+
+        guard !temperatureDevices.isEmpty else {
+            throw WeatherError.yolinkFailed("No YoLink temperature/humidity sensor found")
+        }
+
+        let savedDeviceId = UserDefaults.standard.string(forKey: Self.selectedYoLinkDeviceIdDefaultsKey)
+        let device = temperatureDevices.first { $0.deviceId == savedDeviceId } ?? temperatureDevices[0]
+        selectedYoLinkDeviceId = device.deviceId
+        UserDefaults.standard.set(device.deviceId, forKey: Self.selectedYoLinkDeviceIdDefaultsKey)
+        return device
+    }
+
+    private func sendYoLinkAPIRequest<Response: Decodable>(
+        accessToken: String,
+        packet: YoLinkRequestPacket,
+        responseType: Response.Type
+    ) async throws -> Response {
+        var request = URLRequest(url: URL(string: "https://api.yosmart.com/open/yolink/v2/api")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(packet)
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(responseType, from: data)
     }
 
     private func fetchNationalWeatherServiceContext(latitude: Double, longitude: Double) async throws -> NationalWeatherServiceContext {
@@ -624,6 +756,10 @@ final class WeatherModel: ObservableObject {
         ISO8601DateFormatter().date(from: value)
     }
 
+    private static func currentMilliseconds() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
     private static func formatCoordinateDMS(_ coordinate: Double, positiveSuffix: String, negativeSuffix: String) -> String {
         let absoluteCoordinate = abs(coordinate)
         let degrees = Int(absoluteCoordinate)
@@ -879,6 +1015,117 @@ private struct AirQualitySnapshot {
     let usAQI: Double?
 }
 
+private struct YoLinkConfig {
+    let uaid: String
+    let secret: String
+    let deviceId: String?
+    let deviceToken: String?
+    let deviceName: String?
+
+    static func fromEnvironment() -> YoLinkConfig? {
+        let environment = ProcessInfo.processInfo.environment
+        guard let uaid = trimmedEnvironmentValue("YOLINK_UAID", from: environment),
+              let secret = trimmedEnvironmentValue("YOLINK_SECRET", from: environment) else {
+            return nil
+        }
+
+        return YoLinkConfig(
+            uaid: uaid,
+            secret: secret,
+            deviceId: trimmedEnvironmentValue("YOLINK_DEVICE_ID", from: environment),
+            deviceToken: trimmedEnvironmentValue("YOLINK_DEVICE_TOKEN", from: environment),
+            deviceName: trimmedEnvironmentValue("YOLINK_DEVICE_NAME", from: environment)
+        )
+    }
+
+    private static func trimmedEnvironmentValue(_ key: String, from environment: [String: String]) -> String? {
+        guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+
+        return value
+    }
+}
+
+private struct YoLinkTemperatureSnapshot {
+    let temperatureC: Double
+    let humidity: Double?
+    let reportDate: Date?
+    let deviceName: String
+
+    var sourceSummary: String {
+        let temperatureF = (temperatureC * 9.0 / 5.0) + 32.0
+        let temperatureText = String(format: "%.1f°F / %.1f°C", temperatureF, temperatureC)
+
+        if let humidity {
+            return String(format: "%@ via YoLink, %@, %.0f%% humidity", deviceName, temperatureText, humidity)
+        }
+
+        return "\(deviceName) via YoLink, \(temperatureText)"
+    }
+
+    var observationSummary: String {
+        guard let reportDate else {
+            return "Observed by YoLink outdoor sensor"
+        }
+
+        let timestamp = reportDate.formatted(.dateTime.hour().minute())
+        let ageMinutes = max(0, Date().timeIntervalSince(reportDate) / 60)
+        return String(format: "YoLink reported at %@ (%.0fm old)", timestamp, ageMinutes)
+    }
+}
+
+private struct YoLinkTokenResponse: Decodable {
+    let accessToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+    }
+}
+
+private struct YoLinkRequestPacket: Encodable {
+    let method: String
+    let time: Int64
+    let targetDevice: String?
+    let token: String?
+    let params: [String: String]?
+}
+
+private struct YoLinkBaseResponse<Data: Decodable>: Decodable {
+    let code: String
+    let desc: String?
+    let data: Data
+}
+
+private typealias YoLinkDeviceListResponse = YoLinkBaseResponse<YoLinkDeviceListData>
+private typealias YoLinkTHSensorStateResponse = YoLinkBaseResponse<YoLinkTHSensorStateData>
+
+private struct YoLinkDeviceListData: Decodable {
+    let devices: [YoLinkDevice]
+}
+
+struct YoLinkDevice: Decodable, Identifiable {
+    let deviceId: String
+    let name: String
+    let token: String
+    let type: String
+
+    var id: String {
+        deviceId
+    }
+}
+
+private struct YoLinkTHSensorStateData: Decodable {
+    let online: Bool
+    let state: YoLinkTHSensorState
+    let reportAt: String
+}
+
+private struct YoLinkTHSensorState: Decodable {
+    let temperature: Double
+    let humidity: Double?
+}
+
 private struct NationalWeatherServiceContext {
     let averageTemperatureC: Double?
     let temperatureSourceSummary: String?
@@ -961,11 +1208,14 @@ private struct NWSStationObservation {
 
 private enum WeatherError: LocalizedError {
     case locationFailed
+    case yolinkFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .locationFailed:
             return "Could not determine location from your IP address"
+        case .yolinkFailed(let message):
+            return "Could not load YoLink temperature: \(message)"
         }
     }
 }

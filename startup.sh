@@ -7,6 +7,13 @@ readonly BINARY_PATH="${SCRIPT_DIR}/SwiftTemp"
 readonly PLIST_DIR="${HOME}/Library/LaunchAgents"
 readonly PLIST_PATH="${PLIST_DIR}/com.kastner.swifttemp.plist"
 readonly LAUNCH_TARGET="gui/$(id -u)"
+readonly YOLINK_ENV_KEYS=(
+    YOLINK_UAID
+    YOLINK_SECRET
+    YOLINK_DEVICE_ID
+    YOLINK_DEVICE_TOKEN
+    YOLINK_DEVICE_NAME
+)
 
 usage() {
     cat <<EOF
@@ -19,10 +26,53 @@ Commands:
 EOF
 }
 
+xml_escape() {
+    local value="$1"
+    value="${value//&/&amp;}"
+    value="${value//</&lt;}"
+    value="${value//>/&gt;}"
+    value="${value//\"/&quot;}"
+    value="${value//\'/&apos;}"
+    printf '%s' "${value}"
+}
+
+write_yolink_environment() {
+    local wrote_header=false
+    local key
+    local value
+
+    for key in "${YOLINK_ENV_KEYS[@]}"; do
+        value="${(P)key:-}"
+        if [[ -z "${value}" ]]; then
+            continue
+        fi
+
+        if [[ "${wrote_header}" == false ]]; then
+            cat <<EOF
+    <key>EnvironmentVariables</key>
+    <dict>
+EOF
+            wrote_header=true
+        fi
+
+        cat <<EOF
+        <key>${key}</key>
+        <string>$(xml_escape "${value}")</string>
+EOF
+    done
+
+    if [[ "${wrote_header}" == true ]]; then
+        cat <<EOF
+    </dict>
+EOF
+    fi
+}
+
 write_plist() {
     mkdir -p "${PLIST_DIR}"
 
-    cat > "${PLIST_PATH}" <<EOF
+    {
+        cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -37,9 +87,13 @@ write_plist() {
     <true/>
     <key>KeepAlive</key>
     <false/>
+EOF
+        write_yolink_environment
+        cat <<EOF
 </dict>
 </plist>
 EOF
+    } > "${PLIST_PATH}"
 }
 
 ensure_binary() {
